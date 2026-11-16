@@ -3,4 +3,4 @@ hms-harmful-brain-activity-classification/
 *.csv
 *.parquet
 *.zip
-hhh
+submission.csv
