@@ -1,0 +1,6 @@
+# Databestanden uitsluiten voor GitHub
+hms-harmful-brain-activity-classification/
+*.csv
+*.parquet
+*.zip
+hhh
