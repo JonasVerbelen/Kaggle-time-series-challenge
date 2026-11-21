@@ -19,7 +19,11 @@ from sklearn.model_selection import GroupShuffleSplit
 TARGETS = ["seizure_vote", "lpd_vote", "gpd_vote", "lrda_vote", "grda_vote", "other_vote"]
 FS = 200
 # A small, interpretable subset of EEG electrodes (not the EKG channel).
-CHANNELS = ["Fp1", "F7", "T3", "T5", "O1", "Fp2", "F8", "T4", "T6", "O2"]
+CHANNELS = [
+    "Fp1", "F3", "C3", "P3", "F7", "T3", "T5", "O1",
+    "Fz", "Cz", "Pz",
+    "Fp2", "F4", "C4", "P4", "F8", "T4", "T6", "O2",
+]
 BANDS = [(0.5, 4), (4, 8), (8, 13), (13, 30)]
 
 
@@ -78,13 +82,16 @@ def align_probabilities(model, X, n_classes=6):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=Path, default=Path("/kaggle/input/hms-harmful-brain-activity-classification"))
-    parser.add_argument("--max-train", type=int, default=2000, help="Limit examples for a quick classroom run; 0 uses all rows")
+    parser.add_argument("--max-train", type=int, default=0, help="Limit examples for a quick classroom run; 0 uses all rows")
     parser.add_argument("--submission", action="store_true", help="Also predict the provided test EEGs")
     args = parser.parse_args()
 
     train = pd.read_csv(args.data_dir / "train.csv")
     # Keep one annotated window per EEG for a fast, simple starting point.
-    train = train.drop_duplicates(subset="eeg_id").reset_index(drop=True)
+    agg_dict = {col: "sum" for col in TARGETS}
+    agg_dict["patient_id"] = "first"
+    agg_dict["eeg_label_offset_seconds"] = "median"
+    train = train.groupby("eeg_id", as_index=False).agg(agg_dict)
     if args.max_train > 0 and len(train) > args.max_train:
         train = train.sample(n=args.max_train, random_state=42).reset_index(drop=True)
 
