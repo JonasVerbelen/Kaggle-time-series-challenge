@@ -100,8 +100,15 @@ def main():
     soft_targets = votes / votes.sum(axis=1, keepdims=True)
     hard_targets = np.argmax(soft_targets, axis=1)
 
-    print("Extracting training EEG features...")
-    X = build_features(train, args.data_dir / "train_eegs", is_train=True)
+    cache_file = Path(f"features_train_{len(train)}.npz")
+    if cache_file.exists():
+        print(f"Loading cached training features from {cache_file}...")
+        X = np.load(cache_file)["X"]
+    else:
+        print("Extracting training EEG features...")
+        X = build_features(train, args.data_dir / "train_eegs", is_train=True)
+        np.savez_compressed(cache_file, X=X)
+        print(f"Saved cached features to {cache_file}")
 
     # 5-fold cross-validation grouped by patient_id to prevent data leakage.
     gkf = GroupKFold(n_splits=5)
