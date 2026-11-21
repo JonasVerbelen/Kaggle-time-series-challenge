@@ -14,7 +14,7 @@ import pandas as pd
 from scipy.signal import welch
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, log_loss
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.model_selection import GroupKFold
 
 TARGETS = ["seizure_vote", "lpd_vote", "gpd_vote", "lrda_vote", "grda_vote", "other_vote"]
 FS = 200
@@ -103,30 +103,31 @@ def main():
     print("Extracting training EEG features...")
     X = build_features(train, args.data_dir / "train_eegs", is_train=True)
 
-    # Split by patient, not EEG window, to prevent patient-level leakage.
-    splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    idx_train, idx_val = next(splitter.split(X, hard_targets, groups=train["patient_id"]))
+    # 5-fold cross-validation grouped by patient_id to prevent data leakage.
+    gkf = GroupKFold(n_splits=5)
+    oof_prob = np.zeros_like(soft_targets)
+    models = []
 
-    model = RandomForestClassifier(
-        n_estimators=150, min_samples_leaf=2, random_state=42, n_jobs=-1
-    )
-    model.fit(X[idx_train], hard_targets[idx_train])
-    val_prob = align_probabilities(model, X[idx_val])
-    val_pred = np.argmax(val_prob, axis=1)
-    print(f"Validation accuracy (consensus/majority class): {accuracy_score(hard_targets[idx_val], val_pred):.4f}")
-    print(f"Validation log loss (hard labels): {log_loss(hard_targets[idx_val], val_prob, labels=np.arange(6)):.4f}")
-    # Kaggle uses KL divergence between expert-vote distributions and predictions.
-    y_true = np.clip(soft_targets[idx_val], 1e-12, 1.0)
-    kl = np.mean(np.sum(y_true * (np.log(y_true) - np.log(val_prob)), axis=1))
-    print(f"Validation KL divergence (soft expert votes): {kl:.4f}")
+    for fold, (idx_train, idx_val) in enumerate(gkf.split(X, hard_targets, groups=train["patient_id"])):
+        model = RandomForestClassifier(
+            n_estimators=150, min_samples_leaf=2, random_state=42 + fold, n_jobs=-1
+        )
+        model.fit(X[idx_train], hard_targets[idx_train])
+        oof_prob[idx_val] = align_probabilities(model, X[idx_val])
+        models.append(model)
+
+    oof_pred = np.argmax(oof_prob, axis=1)
+    print(f"5-fold OOF accuracy (consensus/majority class): {accuracy_score(hard_targets, oof_pred):.4f}")
+    print(f"5-fold OOF log loss (hard labels): {log_loss(hard_targets, oof_prob, labels=np.arange(6)):.4f}")
+    y_true = np.clip(soft_targets, 1e-12, 1.0)
+    kl = np.mean(np.sum(y_true * (np.log(y_true) - np.log(oof_prob)), axis=1))
+    print(f"5-fold OOF KL divergence (soft expert votes): {kl:.4f}")
 
     if args.submission:
-        print("Refitting on all selected training recordings...")
-        model.fit(X, hard_targets)
         test = pd.read_csv(args.data_dir / "test.csv")
         print("Extracting test EEG features...")
         X_test = build_features(test, args.data_dir / "test_eegs", is_train=False)
-        pred = align_probabilities(model, X_test)
+        pred = np.mean([align_probabilities(m, X_test) for m in models], axis=0)
         submission = pd.DataFrame(pred, columns=TARGETS)
         submission.insert(0, "eeg_id", test["eeg_id"].to_numpy())
         submission.to_csv("submission.csv", index=False)
