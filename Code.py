@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.signal import welch
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import accuracy_score, log_loss
 from sklearn.model_selection import GroupKFold
 
@@ -160,11 +160,11 @@ def build_features(metadata, eeg_folder, spec_folder, is_train=True):
     return np.vstack(X)
 
 
-def align_probabilities(model, X, n_classes=6):
-    """Keep all six classes even when a small training subset omits one."""
-    p = np.zeros((len(X), n_classes), dtype=float)
-    p[:, model.classes_.astype(int)] = model.predict_proba(X)
-    return np.clip(p, 1e-8, None) / np.clip(p, 1e-8, None).sum(axis=1, keepdims=True)
+def predict_soft_probabilities(fold_models, X):
+    """Predict normalized 6-class probability distributions from per-class regressors."""
+    preds = np.column_stack([m.predict(X) for m in fold_models])
+    preds = np.clip(preds, 1e-6, None)
+    return preds / preds.sum(axis=1, keepdims=True)
 
 
 def main():
@@ -204,14 +204,27 @@ def main():
     gkf = GroupKFold(n_splits=5)
     oof_prob = np.zeros_like(soft_targets)
     models = []
+    sample_weights = np.log1p(votes.sum(axis=1))
 
     for fold, (idx_train, idx_val) in enumerate(gkf.split(X, hard_targets, groups=train["patient_id"])):
-        model = RandomForestClassifier(
-            n_estimators=150, min_samples_leaf=2, random_state=42 + fold, n_jobs=-1
-        )
-        model.fit(X[idx_train], hard_targets[idx_train])
-        oof_prob[idx_val] = align_probabilities(model, X[idx_val])
-        models.append(model)
+        fold_models = []
+        for cls_idx in range(len(TARGETS)):
+            reg = HistGradientBoostingRegressor(
+                max_iter=250,
+                learning_rate=0.05,
+                max_leaf_nodes=31,
+                min_samples_leaf=20,
+                l2_regularization=1.0,
+                random_state=42 + fold * 10 + cls_idx,
+            )
+            reg.fit(
+                X[idx_train],
+                soft_targets[idx_train, cls_idx],
+                sample_weight=sample_weights[idx_train],
+            )
+            fold_models.append(reg)
+        oof_prob[idx_val] = predict_soft_probabilities(fold_models, X[idx_val])
+        models.append(fold_models)
 
     oof_pred = np.argmax(oof_prob, axis=1)
     print(f"5-fold OOF accuracy (consensus/majority class): {accuracy_score(hard_targets, oof_pred):.4f}")
@@ -224,7 +237,7 @@ def main():
         test = pd.read_csv(args.data_dir / "test.csv")
         print("Extracting test EEG features...")
         X_test = build_features(test, args.data_dir / "test_eegs", args.data_dir / "test_spectrograms", is_train=False)
-        pred = np.mean([align_probabilities(m, X_test) for m in models], axis=0)
+        pred = np.mean([predict_soft_probabilities(m, X_test) for m in models], axis=0)
         submission = pd.DataFrame(pred, columns=TARGETS)
         submission.insert(0, "eeg_id", test["eeg_id"].to_numpy())
         submission.to_csv("submission.csv", index=False)
