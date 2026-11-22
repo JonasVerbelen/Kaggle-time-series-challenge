@@ -27,7 +27,32 @@ CHANNELS = [
 BANDS = [(0.5, 4), (4, 8), (8, 13), (13, 30)]
 LEFT_CHANNELS = ["Fp1", "F3", "C3", "P3", "F7", "T3", "T5", "O1"]
 RIGHT_CHANNELS = ["Fp2", "F4", "C4", "P4", "F8", "T4", "T6", "O2"]
+BIPOLAR_PAIRS = [
+    ("Fp1", "F7"), ("F7", "T3"), ("T3", "T5"), ("T5", "O1"),
+    ("Fp1", "F3"), ("F3", "C3"), ("C3", "P3"), ("P3", "O1"),
+    ("Fp2", "F8"), ("F8", "T4"), ("T4", "T6"), ("T6", "O2"),
+    ("Fp2", "F4"), ("F4", "C4"), ("C4", "P4"), ("P4", "O2"),
+]
 
+def _channel_features(x):
+    feats = [np.mean(x), np.std(x), np.ptp(x)]
+    frequencies, psd = welch(x, fs=FS, nperseg=min(512, len(x)))
+    total_mask = (frequencies >= 0.5) & (frequencies < 30.0)
+    psd_total = psd[total_mask]
+    total_power = np.sum(psd_total) + 1e-12
+    psd_norm = psd_total / total_power
+    spec_entropy = -np.sum(psd_norm * np.log2(psd_norm + 1e-12)) / np.log2(len(psd_norm) + 1e-12)
+    feats.append(spec_entropy)
+
+    log_bp, rel_bp = [], []
+    for low, high in BANDS:
+        mask = (frequencies >= low) & (frequencies < high)
+        bp = np.sum(psd[mask])
+        log_bp.append(np.log1p(bp))
+        rel_bp.append(bp / total_power)
+    feats.extend(log_bp)
+    feats.extend(rel_bp)
+    return feats, np.array(log_bp, dtype=np.float64)
 
 def extract_features(eeg_path, offset_seconds=0.0):
     """Extract features from the central 10 s of a 50 s annotated segment.
@@ -46,6 +71,7 @@ def extract_features(eeg_path, offset_seconds=0.0):
         raise ValueError(f"EEG window outside file: {eeg_path}, offset={offset_seconds}")
     segment = frame.iloc[start:end][channels].to_numpy(dtype=np.float64)
 
+    clean_signals = {}
     features = []
     channel_log_bands = {}
     for j, ch in enumerate(channels):
@@ -56,25 +82,19 @@ def extract_features(eeg_path, offset_seconds=0.0):
             fill = np.nanmedian(x[np.isfinite(x)])
             x = np.where(np.isfinite(x), x, fill)
         x = np.clip(x, -1000, 1000)
-        features.extend([np.mean(x), np.std(x), np.ptp(x)])
+        clean_signals[ch] = x
 
-        frequencies, psd = welch(x, fs=FS, nperseg=min(512, len(x)))
-        total_mask = (frequencies >= 0.5) & (frequencies < 30.0)
-        psd_total = psd[total_mask]
-        total_power = np.sum(psd_total) + 1e-12
-        psd_norm = psd_total / total_power
-        spec_entropy = -np.sum(psd_norm * np.log2(psd_norm + 1e-12)) / np.log2(len(psd_norm) + 1e-12)
-        features.append(spec_entropy)
+        feats, log_bp = _channel_features(x)
+        features.extend(feats)
+        channel_log_bands[ch]= np.array(log_bp, dtype=np.float64)
 
-        log_bp, rel_bp = [], []
-        for low, high in BANDS:
-            mask = (frequencies >= low) & (frequencies < high)
-            bp = np.sum(psd[mask])
-            log_bp.append(np.log1p(bp))
-            rel_bp.append(bp / total_power)
-        features.extend(log_bp)
-        features.extend(rel_bp)
-        channel_log_bands[ch] = np.array(log_bp, dtype=np.float64)
+
+    for ch1, ch2 in BIPOLAR_PAIRS:
+        if ch1 in clean_signals and ch2 in clean_signals:
+            feats, _ = _channel_features(clean_signals[ch1] - clean_signals[ch2])
+            features.extend(feats)
+        else:
+            features.extend([0.0] * 12)
 
     for l_ch, r_ch in zip(LEFT_CHANNELS, RIGHT_CHANNELS):
         if l_ch in channel_log_bands and r_ch in channel_log_bands:
@@ -125,7 +145,7 @@ def main():
     soft_targets = votes / votes.sum(axis=1, keepdims=True)
     hard_targets = np.argmax(soft_targets, axis=1)
 
-    cache_file = Path(f"features_train_d_{len(train)}.npz")
+    cache_file = Path(f"features_train_e_{len(train)}.npz")
     if cache_file.exists():
         print(f"Loading cached training features from {cache_file}...")
         X = np.load(cache_file)["X"]
