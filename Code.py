@@ -25,6 +25,8 @@ CHANNELS = [
     "Fp2", "F4", "C4", "P4", "F8", "T4", "T6", "O2",
 ]
 BANDS = [(0.5, 4), (4, 8), (8, 13), (13, 30)]
+LEFT_CHANNELS = ["Fp1", "F3", "C3", "P3", "F7", "T3", "T5", "O1"]
+RIGHT_CHANNELS = ["Fp2", "F4", "C4", "P4", "F8", "T4", "T6", "O2"]
 
 
 def extract_features(eeg_path, offset_seconds=0.0):
@@ -45,7 +47,8 @@ def extract_features(eeg_path, offset_seconds=0.0):
     segment = frame.iloc[start:end][channels].to_numpy(dtype=np.float64)
 
     features = []
-    for j in range(len(channels)):
+    channel_log_bands = {}
+    for j, ch in enumerate(channels):
         x = segment[:, j]
         if not np.isfinite(x).any():
             x = np.zeros_like(x)
@@ -54,11 +57,33 @@ def extract_features(eeg_path, offset_seconds=0.0):
             x = np.where(np.isfinite(x), x, fill)
         x = np.clip(x, -1000, 1000)
         features.extend([np.mean(x), np.std(x), np.ptp(x)])
+
         frequencies, psd = welch(x, fs=FS, nperseg=min(512, len(x)))
+        total_mask = (frequencies >= 0.5) & (frequencies < 30.0)
+        psd_total = psd[total_mask]
+        total_power = np.sum(psd_total) + 1e-12
+        psd_norm = psd_total / total_power
+        spec_entropy = -np.sum(psd_norm * np.log2(psd_norm + 1e-12)) / np.log2(len(psd_norm) + 1e-12)
+        features.append(spec_entropy)
+
+        log_bp, rel_bp = [], []
         for low, high in BANDS:
             mask = (frequencies >= low) & (frequencies < high)
-            features.append(np.log1p(np.sum(psd[mask])))
-    return np.asarray(features, dtype=np.float32)
+            bp = np.sum(psd[mask])
+            log_bp.append(np.log1p(bp))
+            rel_bp.append(bp / total_power)
+        features.extend(log_bp)
+        features.extend(rel_bp)
+        channel_log_bands[ch] = np.array(log_bp, dtype=np.float64)
+
+    for l_ch, r_ch in zip(LEFT_CHANNELS, RIGHT_CHANNELS):
+        if l_ch in channel_log_bands and r_ch in channel_log_bands:
+            features.extend((channel_log_bands[l_ch] - channel_log_bands[r_ch]).tolist())
+        else:
+            features.extend([0.0] * len(BANDS))
+
+    arr = np.asarray(features, dtype=np.float32)
+    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def build_features(metadata, eeg_folder, is_train=True):
@@ -100,7 +125,7 @@ def main():
     soft_targets = votes / votes.sum(axis=1, keepdims=True)
     hard_targets = np.argmax(soft_targets, axis=1)
 
-    cache_file = Path(f"features_train_{len(train)}.npz")
+    cache_file = Path(f"features_train_d_{len(train)}.npz")
     if cache_file.exists():
         print(f"Loading cached training features from {cache_file}...")
         X = np.load(cache_file)["X"]
