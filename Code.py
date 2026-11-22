@@ -65,12 +65,21 @@ def extract_features(eeg_path, offset_seconds=0.0):
     if not channels:
         raise ValueError(f"No expected EEG channels in {eeg_path}")
 
-    start = int(round((float(offset_seconds) + 20.0) * FS))
-    end = start + 10 * FS
-    if end > len(frame):
+    start_50 = int(round(float(offset_seconds) * FS))
+    end_50 = start_50 + 50 * FS
+    if end_50 > len(frame):
         raise ValueError(f"EEG window outside file: {eeg_path}, offset={offset_seconds}")
-    segment = frame.iloc[start:end][channels].to_numpy(dtype=np.float64)
+    seg_50 = frame.iloc[start_50:end_50][channels].to_numpy(dtype=np.float64)
+    seg_10 = seg_50[20 * FS : 30 * FS]
 
+    feat_10 = _extract_window_features(seg_10, channels)
+    feat_50 = _extract_window_features(seg_50, channels)
+    feat_diff = feat_10 - feat_50
+
+    arr = np.concatenate([feat_10, feat_50, feat_diff])
+    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+def _extract_window_features(segment, channels):
     clean_signals = {}
     features = []
     channel_log_bands = {}
@@ -103,7 +112,7 @@ def extract_features(eeg_path, offset_seconds=0.0):
             features.extend([0.0] * len(BANDS))
 
     arr = np.asarray(features, dtype=np.float32)
-    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    return arr
 
 
 def build_features(metadata, eeg_folder, is_train=True):
@@ -145,14 +154,14 @@ def main():
     soft_targets = votes / votes.sum(axis=1, keepdims=True)
     hard_targets = np.argmax(soft_targets, axis=1)
 
-    cache_file = Path(f"features_train_e_{len(train)}.npz")
+    cache_file = Path(f"/tmp/features_train_f_{len(train)}.npz")
     if cache_file.exists():
         print(f"Loading cached training features from {cache_file}...")
         X = np.load(cache_file)["X"]
     else:
         print("Extracting training EEG features...")
         X = build_features(train, args.data_dir / "train_eegs", is_train=True)
-        np.savez_compressed(cache_file, X=X)
+        np.savez(cache_file, X=X)
         print(f"Saved cached features to {cache_file}")
 
     # 5-fold cross-validation grouped by patient_id to prevent data leakage.
