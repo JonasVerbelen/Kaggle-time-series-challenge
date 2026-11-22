@@ -33,6 +33,41 @@ BIPOLAR_PAIRS = [
     ("Fp2", "F8"), ("F8", "T4"), ("T4", "T6"), ("T6", "O2"),
     ("Fp2", "F4"), ("F4", "C4"), ("C4", "P4"), ("P4", "O2"),
 ]
+SPEC_REGIONS = ["LL", "RL", "LP", "RP"]
+
+
+def extract_spectrogram_features(spec_path, offset_seconds=0.0):
+    """Extract summary log-power features from the 10-min and central spectrogram."""
+    spec = pd.read_parquet(spec_path)
+    if "time" in spec.columns:
+        t = spec["time"].to_numpy(dtype=np.float64)
+        center = float(offset_seconds) + 300.0
+        mask_center = (t >= center - 10.0) & (t <= center + 10.0)
+        spec_center = spec.loc[mask_center] if mask_center.any() else spec
+    else:
+        mid = len(spec) // 2
+        spec_center = spec.iloc[max(0, mid - 5) : min(len(spec), mid + 5)]
+
+    features = []
+    for win_df in (spec_center, spec):
+        for region in SPEC_REGIONS:
+            cols = [c for c in win_df.columns if c.startswith(f"{region}_")]
+            if not cols:
+                features.extend([0.0] * (2 * len(BANDS)))
+                continue
+            freqs = np.array([float(c.split("_")[1]) for c in cols])
+            vals = np.log1p(np.clip(win_df[cols].to_numpy(dtype=np.float64), 0.0, None))
+            for low, high in BANDS:
+                bmask = (freqs >= low) & (freqs < high)
+                if bmask.any():
+                    band_vals = vals[:, bmask]
+                    features.append(float(np.nanmean(band_vals)))
+                    features.append(float(np.nanstd(band_vals)))
+                else:
+                    features.extend([0.0, 0.0])
+
+    arr = np.asarray(features, dtype=np.float32)
+    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
 
 def _channel_features(x):
     feats = [np.mean(x), np.std(x), np.ptp(x)]
@@ -65,18 +100,13 @@ def extract_features(eeg_path, offset_seconds=0.0):
     if not channels:
         raise ValueError(f"No expected EEG channels in {eeg_path}")
 
-    start_50 = int(round(float(offset_seconds) * FS))
-    end_50 = start_50 + 50 * FS
-    if end_50 > len(frame):
+    start = int(round((float(offset_seconds) + 20.0) * FS))
+    end = start + 10 * FS
+    if end > len(frame):
         raise ValueError(f"EEG window outside file: {eeg_path}, offset={offset_seconds}")
-    seg_50 = frame.iloc[start_50:end_50][channels].to_numpy(dtype=np.float64)
-    seg_10 = seg_50[20 * FS : 30 * FS]
+    segment = frame.iloc[start:end][channels].to_numpy(dtype=np.float64)
 
-    feat_10 = _extract_window_features(seg_10, channels)
-    feat_50 = _extract_window_features(seg_50, channels)
-    feat_diff = feat_10 - feat_50
-
-    arr = np.concatenate([feat_10, feat_50, feat_diff])
+    arr = _extract_window_features(segment, channels)
     return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
 
 def _extract_window_features(segment, channels):
@@ -115,12 +145,16 @@ def _extract_window_features(segment, channels):
     return arr
 
 
-def build_features(metadata, eeg_folder, is_train=True):
+def build_features(metadata, eeg_folder, spec_folder, is_train=True):
     X = []
     for i, row in enumerate(metadata.itertuples(index=False)):
         eeg_path = eeg_folder / f"{row.eeg_id}.parquet"
-        offset = row.eeg_label_offset_seconds if is_train else 0.0
-        X.append(extract_features(eeg_path, offset))
+        spec_path = spec_folder / f"{row.spectrogram_id}.parquet"
+        eeg_offset = row.eeg_label_offset_seconds if is_train else 0.0
+        spec_offset = row.spectrogram_label_offset_seconds if is_train else 0.0
+        f_eeg = extract_features(eeg_path, eeg_offset)
+        f_spec = extract_spectrogram_features(spec_path, spec_offset)
+        X.append(np.concatenate([f_eeg, f_spec]))
         if (i + 1) % 200 == 0:
             print(f"  Extracted {i + 1}/{len(metadata)} recordings")
     return np.vstack(X)
@@ -145,6 +179,8 @@ def main():
     agg_dict = {col: "sum" for col in TARGETS}
     agg_dict["patient_id"] = "first"
     agg_dict["eeg_label_offset_seconds"] = "median"
+    agg_dict["spectrogram_id"] = "first"
+    agg_dict["spectrogram_label_offset_seconds"] = "median"
     train = train.groupby("eeg_id", as_index=False).agg(agg_dict)
     if args.max_train > 0 and len(train) > args.max_train:
         train = train.sample(n=args.max_train, random_state=42).reset_index(drop=True)
@@ -154,13 +190,13 @@ def main():
     soft_targets = votes / votes.sum(axis=1, keepdims=True)
     hard_targets = np.argmax(soft_targets, axis=1)
 
-    cache_file = Path(f"/tmp/features_train_f_{len(train)}.npz")
+    cache_file = Path(f"/tmp/features_train_g_{len(train)}.npz")
     if cache_file.exists():
         print(f"Loading cached training features from {cache_file}...")
         X = np.load(cache_file)["X"]
     else:
         print("Extracting training EEG features...")
-        X = build_features(train, args.data_dir / "train_eegs", is_train=True)
+        X = build_features(train, args.data_dir / "train_eegs", args.data_dir / "train_spectrograms", is_train=True)
         np.savez(cache_file, X=X)
         print(f"Saved cached features to {cache_file}")
 
@@ -187,7 +223,7 @@ def main():
     if args.submission:
         test = pd.read_csv(args.data_dir / "test.csv")
         print("Extracting test EEG features...")
-        X_test = build_features(test, args.data_dir / "test_eegs", is_train=False)
+        X_test = build_features(test, args.data_dir / "test_eegs", args.data_dir / "test_spectrograms", is_train=False)
         pred = np.mean([align_probabilities(m, X_test) for m in models], axis=0)
         submission = pd.DataFrame(pred, columns=TARGETS)
         submission.insert(0, "eeg_id", test["eeg_id"].to_numpy())
