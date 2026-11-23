@@ -6,6 +6,8 @@ Run in a Kaggle notebook with the HMS competition dataset attached, or locally:
 Requires: numpy, pandas, scipy, scikit-learn, pyarrow.
 This is a teaching baseline, not a competitive Kaggle solution.
 """
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 import argparse
 from pathlib import Path
 
@@ -47,30 +49,42 @@ def extract_spectrogram_features(spec_path, offset_seconds=0.0):
     if "time" in spec.columns:
         t = spec["time"].to_numpy(dtype=np.float64)
         center = float(offset_seconds) + 300.0
-        mask_center = (t >= center - 10.0) & (t <= center + 10.0)
-        spec_center = spec.loc[mask_center] if mask_center.any() else spec
+        m20 = (t >= center - 10.0) & (t <= center + 10.0)
+        m120 = (t >= center - 60.0) & (t <= center + 60.0)
+        spec_20 = spec.loc[m20] if m20.any() else spec
+        spec_120 = spec.loc[m120] if m120.any() else spec
     else:
         mid = len(spec) // 2
-        spec_center = spec.iloc[max(0, mid - 5) : min(len(spec), mid + 5)]
+        spec_20 = spec.iloc[max(0, mid - 5) : min(len(spec), mid + 5)]
+        spec_120 = spec.iloc[max(0, mid - 30) : min(len(spec), mid + 30)]
 
     features = []
-    for win_df in (spec_center, spec):
+    for win_df in (spec_20, spec_120, spec):
+        region_means = {}
         for region in SPEC_REGIONS:
             cols = [c for c in win_df.columns if c.startswith(f"{region}_")]
             if not cols:
                 features.extend([0.0] * (2 * len(BANDS)))
+                region_means[region] = np.zeros(len(BANDS), dtype=np.float64)
                 continue
             freqs = np.array([float(c.split("_")[1]) for c in cols])
             vals = np.log1p(np.clip(win_df[cols].to_numpy(dtype=np.float64), 0.0, None))
+            r_means = []
             for low, high in BANDS:
                 bmask = (freqs >= low) & (freqs < high)
                 if bmask.any():
                     band_vals = vals[:, bmask]
-                    features.append(float(np.nanmean(band_vals)))
+                    m_val = float(np.nanmean(band_vals))
+                    features.append(m_val)
                     features.append(float(np.nanstd(band_vals)))
+                    r_means.append(m_val)
                 else:
                     features.extend([0.0, 0.0])
+                    r_means.append(0.0)
+            region_means[region] = np.array(r_means, dtype=np.float64)
 
+        features.extend((region_means["LL"] - region_means["RL"]).tolist())
+        features.extend((region_means["LP"] - region_means["RP"]).tolist())
     arr = np.asarray(features, dtype=np.float32)
     return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -207,7 +221,7 @@ def main():
     soft_targets = votes / votes.sum(axis=1, keepdims=True)
     hard_targets = np.argmax(soft_targets, axis=1)
 
-    cache_file = Path(f"/tmp/features_train_g_{len(train)}.npz")
+    cache_file = Path(f"/tmp/features_train_k_{len(train)}.npz")
     if cache_file.exists():
         print(f"Loading cached training features from {cache_file}...")
         X = np.load(cache_file)["X"]
