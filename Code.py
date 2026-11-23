@@ -16,6 +16,10 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import accuracy_score, log_loss
 from sklearn.model_selection import GroupKFold
 from scipy.optimize import minimize
+from sklearn.impute import SimpleImputer
+from sklearn.neural_network import MLPRegressor
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 TARGETS = ["seizure_vote", "lpd_vote", "gpd_vote", "lrda_vote", "grda_vote", "other_vote"]
 FS = 200
@@ -174,6 +178,11 @@ def calibrate_probabilities(probs, temp=1.0, eps=1e-4):
     p = np.clip(p, eps, None)
     return p / p.sum(axis=1, keepdims=True)
 
+def predict_mlp_probabilities(mlp_model, X):
+    """Predict normalized 6-class probability distributions from an MLPRegressor."""
+    preds = np.clip(mlp_model.predict(X), 1e-6, None)
+    return preds / preds.sum(axis=1, keepdims=True)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -210,8 +219,10 @@ def main():
 
     # 5-fold cross-validation grouped by patient_id to prevent data leakage.
     gkf = GroupKFold(n_splits=5)
-    oof_prob = np.zeros_like(soft_targets)
-    models = []
+    oof_hgb = np.zeros_like(soft_targets)
+    oof_mlp = np.zeros_like(soft_targets)
+    hgb_models = []
+    mlp_models = []
     sample_weights = np.log1p(votes.sum(axis=1))
 
     for fold, (idx_train, idx_val) in enumerate(gkf.split(X, hard_targets, groups=train["patient_id"])):
@@ -231,24 +242,43 @@ def main():
                 sample_weight=sample_weights[idx_train],
             )
             fold_models.append(reg)
-        oof_prob[idx_val] = predict_soft_probabilities(fold_models, X[idx_val])
-        models.append(fold_models)
+        oof_hgb[idx_val] = predict_soft_probabilities(fold_models, X[idx_val])
+        hgb_models.append(fold_models)
+
+        mlp = make_pipeline(
+            SimpleImputer(strategy="constant", fill_value=0.0),
+            StandardScaler(),
+            MLPRegressor(
+                hidden_layer_sizes=(256, 128),
+                alpha=1.0,
+                batch_size=256,
+                learning_rate_init=1e-3,
+                max_iter=40,
+                early_stopping=True,
+                validation_fraction=0.1,
+                random_state=42 + fold,
+            ),
+        )
+        mlp.fit(X[idx_train], soft_targets[idx_train])
+        oof_mlp[idx_val] = predict_mlp_probabilities(mlp, X[idx_val])
+        mlp_models.append(mlp)
 
     y_true = np.clip(soft_targets, 1e-12, 1.0)
 
     def kl_loss(params):
-        temp, eps = params
-        cal = calibrate_probabilities(oof_prob, temp=temp, eps=eps)
+        w, temp, eps = params
+        blend = w * oof_hgb + (1.0 - w) * oof_mlp
+        cal = calibrate_probabilities(blend, temp=temp, eps=eps)
         return float(np.mean(np.sum(y_true * (np.log(y_true) - np.log(cal)), axis=1)))
 
     res = minimize(
         kl_loss,
-        x0=[1.0, 0.005],
-        bounds=[(0.5, 2.0), (1e-5, 0.05)],
+        x0=[0.75, 0.85, 0.01],
+        bounds=[(0.0, 1.0), (0.5, 2.0), (1e-5, 0.05)],
         method="Nelder-Mead",
     )
-    best_temp, best_eps = res.x
-    oof_prob = calibrate_probabilities(oof_prob, temp=best_temp, eps=best_eps)
+    best_w, best_temp, best_eps = res.x
+    oof_prob = calibrate_probabilities(best_w * oof_hgb + (1.0 - best_w) * oof_mlp, temp=best_temp, eps=best_eps)
 
     oof_pred = np.argmax(oof_prob, axis=1)
     print(f"Optimal temperature: {best_temp:.3f} | Floor eps: {best_eps:.5f}")
@@ -261,8 +291,9 @@ def main():
         test = pd.read_csv(args.data_dir / "test.csv")
         print("Extracting test EEG features...")
         X_test = build_features(test, args.data_dir / "test_eegs", args.data_dir / "test_spectrograms", is_train=False)
-        pred = np.mean([predict_soft_probabilities(m, X_test) for m in models], axis=0)
-        pred = calibrate_probabilities(pred, temp=best_temp, eps=best_eps)
+        pred_hgb = np.mean([predict_soft_probabilities(m, X_test) for m in hgb_models], axis=0)
+        pred_mlp = np.mean([predict_mlp_probabilities(m, X_test) for m in mlp_models], axis=0)
+        pred = calibrate_probabilities(best_w * pred_hgb + (1.0 - best_w) * pred_mlp, temp=best_temp, eps=best_eps)
         submission = pd.DataFrame(pred, columns=TARGETS)
         submission.insert(0, "eeg_id", test["eeg_id"].to_numpy())
         submission.to_csv("submission.csv", index=False)
