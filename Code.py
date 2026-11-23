@@ -15,6 +15,7 @@ from scipy.signal import welch
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import accuracy_score, log_loss
 from sklearn.model_selection import GroupKFold
+from scipy.optimize import minimize
 
 TARGETS = ["seizure_vote", "lpd_vote", "gpd_vote", "lrda_vote", "grda_vote", "other_vote"]
 FS = 200
@@ -166,6 +167,13 @@ def predict_soft_probabilities(fold_models, X):
     preds = np.clip(preds, 1e-6, None)
     return preds / preds.sum(axis=1, keepdims=True)
 
+def calibrate_probabilities(probs, temp=1.0, eps=1e-4):
+    """Apply temperature scaling and a minimum probability floor for KL divergence."""
+    p = np.clip(probs, eps, 1.0)
+    p = np.power(p, 1.0 / temp)
+    p = np.clip(p, eps, None)
+    return p / p.sum(axis=1, keepdims=True)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -226,10 +234,26 @@ def main():
         oof_prob[idx_val] = predict_soft_probabilities(fold_models, X[idx_val])
         models.append(fold_models)
 
+    y_true = np.clip(soft_targets, 1e-12, 1.0)
+
+    def kl_loss(params):
+        temp, eps = params
+        cal = calibrate_probabilities(oof_prob, temp=temp, eps=eps)
+        return float(np.mean(np.sum(y_true * (np.log(y_true) - np.log(cal)), axis=1)))
+
+    res = minimize(
+        kl_loss,
+        x0=[1.0, 0.005],
+        bounds=[(0.5, 2.0), (1e-5, 0.05)],
+        method="Nelder-Mead",
+    )
+    best_temp, best_eps = res.x
+    oof_prob = calibrate_probabilities(oof_prob, temp=best_temp, eps=best_eps)
+
     oof_pred = np.argmax(oof_prob, axis=1)
+    print(f"Optimal temperature: {best_temp:.3f} | Floor eps: {best_eps:.5f}")
     print(f"5-fold OOF accuracy (consensus/majority class): {accuracy_score(hard_targets, oof_pred):.4f}")
     print(f"5-fold OOF log loss (hard labels): {log_loss(hard_targets, oof_prob, labels=np.arange(6)):.4f}")
-    y_true = np.clip(soft_targets, 1e-12, 1.0)
     kl = np.mean(np.sum(y_true * (np.log(y_true) - np.log(oof_prob)), axis=1))
     print(f"5-fold OOF KL divergence (soft expert votes): {kl:.4f}")
 
@@ -238,6 +262,7 @@ def main():
         print("Extracting test EEG features...")
         X_test = build_features(test, args.data_dir / "test_eegs", args.data_dir / "test_spectrograms", is_train=False)
         pred = np.mean([predict_soft_probabilities(m, X_test) for m in models], axis=0)
+        pred = calibrate_probabilities(pred, temp=best_temp, eps=best_eps)
         submission = pd.DataFrame(pred, columns=TARGETS)
         submission.insert(0, "eeg_id", test["eeg_id"].to_numpy())
         submission.to_csv("submission.csv", index=False)
